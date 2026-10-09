@@ -95,6 +95,34 @@ bool StatisticsPropagator::HandleJoinAlwaysMatches(LogicalJoin &join, unique_ptr
 	}
 }
 
+static idx_t CountComparisons(const LogicalComparisonJoin &join) {
+	idx_t comparison_count = 0;
+	for (auto &condition : join.conditions) {
+		if (condition.IsComparison()) {
+			comparison_count++;
+		}
+	}
+	return comparison_count;
+}
+
+//! A comparison join whose comparisons were all pruned is an ANY join on its remaining predicates. The conversion is
+//! only done for a plain comparison join (DELIM and ASOF joins carry semantics beyond their conditions) with a join
+//! type the ANY join can execute (the blockwise NL join does not implement MARK, SINGLE, RIGHT_SEMI or RIGHT_ANTI).
+static bool CanConvertToAnyJoin(const LogicalComparisonJoin &join) {
+	if (join.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return false;
+	}
+	switch (join.join_type) {
+	case JoinType::MARK:
+	case JoinType::SINGLE:
+	case JoinType::RIGHT_SEMI:
+	case JoinType::RIGHT_ANTI:
+		return false;
+	default:
+		return true;
+	}
+}
+
 void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, unique_ptr<LogicalOperator> &node_ptr) {
 	for (idx_t i = 0; i < join.conditions.size(); i++) {
 		auto &condition = join.conditions[i];
@@ -142,12 +170,31 @@ void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, uniq
 						break;
 					}
 				}
-				if (join.conditions.size() > 1) {
-					// there are multiple conditions: erase this condition
+				if (CountComparisons(join) > 1) {
+					// another comparison carries the join: erase this condition
 					join.conditions.erase_at(i);
 					i--;
 					removed_expressions = true;
 					continue;
+				}
+				if (join.conditions.size() > 1) {
+					// this is the last comparison and only arbitrary predicates remain
+					// the planner only builds a comparison join around a comparison (LogicalComparisonJoin::CreateJoin)
+					// without one the join is an ANY join on the remaining predicates
+					if (!CanConvertToAnyJoin(join)) {
+						// keep the (always true) comparison so the join keeps its operator type
+						continue;
+					}
+					join.conditions.erase_at(i);
+					auto any_join = make_uniq<LogicalAnyJoin>(join.join_type);
+					any_join->children = std::move(join.children);
+					any_join->condition = JoinCondition::CreateExpression(std::move(join.conditions));
+					LogicalJoin::MoveJoinState(join, *any_join);
+					node_ptr = std::move(any_join);
+					removed_expressions = true;
+					// the remaining predicates may be prunable on their own
+					PropagateStatistics(node_ptr->Cast<LogicalAnyJoin>(), node_ptr);
+					return;
 				}
 				// this is the only condition and it is always true: all conditions are true
 				if (HandleJoinAlwaysMatches(join, node_ptr)) {

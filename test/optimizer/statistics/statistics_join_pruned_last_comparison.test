@@ -1,0 +1,194 @@
+# name: test/optimizer/statistics/statistics_join_pruned_last_comparison.test
+# description: Statistics propagation prunes the last comparison of a join that also has arbitrary predicates
+# group: [statistics]
+
+# The join below has one comparison (raw_begin <= be) and one arbitrary predicate (raw_end IS NULL OR raw_end >= bs).
+# With a single-row billing_month the statistics prove the comparison always true, so it is pruned. The join is then
+# an ANY join on the remaining predicate (the shape the planner builds for an ON clause without a comparison), which
+# can be reordered and whose predicate can be pruned further, instead of a comparison join without a comparison.
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TABLE links(id INT, raw_begin DATE, raw_end DATE);
+
+statement ok
+INSERT INTO links VALUES (1, DATE '2026-01-05', NULL), (2, DATE '2026-01-10', DATE '2026-01-20'), (3, DATE '2026-01-15', DATE '2025-12-31');
+
+statement ok
+CREATE TABLE billing_month(bs DATE, be DATE);
+
+statement ok
+INSERT INTO billing_month VALUES (DATE '2026-01-01', DATE '2026-01-31');
+
+statement ok
+PRAGMA explain_output = OPTIMIZED_ONLY;
+
+# the comparison is pruned and the join becomes an ANY join on the remaining predicate
+query II
+EXPLAIN SELECT l.id FROM links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs);
+----
+logical_opt	<REGEX>:.*ANY_JOIN.*
+
+query II
+EXPLAIN SELECT l.id FROM links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs);
+----
+logical_opt	<!REGEX>:.*COMPARISON_JOIN.*
+
+query II
+EXPLAIN SELECT l.id FROM links l LEFT JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs);
+----
+logical_opt	<REGEX>:.*ANY_JOIN.*
+
+# inner
+query I
+SELECT l.id FROM links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1
+2
+
+# the comparison side flipped
+query I
+SELECT l.id FROM links l JOIN billing_month bm ON bm.be >= l.raw_begin AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1
+2
+
+# the predicate listed before the comparison
+query I
+SELECT l.id FROM links l JOIN billing_month bm ON (l.raw_end IS NULL OR l.raw_end >= bm.bs) AND l.raw_begin <= bm.be ORDER BY 1;
+----
+1
+2
+
+# two arbitrary predicates
+query I
+SELECT l.id FROM links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) AND (l.id IS NULL OR l.id < 3) ORDER BY 1;
+----
+1
+2
+
+# left outer: the unmatched row survives with NULLs
+query II
+SELECT l.id, bm.bs FROM links l LEFT JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1	2026-01-01
+2	2026-01-01
+3	NULL
+
+# right outer
+query II
+SELECT l.id, bm.bs FROM links l RIGHT JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1	2026-01-01
+2	2026-01-01
+
+# full outer
+query II
+SELECT l.id, bm.bs FROM links l FULL JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1	2026-01-01
+2	2026-01-01
+3	NULL
+
+# semi / anti
+query I
+SELECT l.id FROM links l SEMI JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1
+2
+
+query I
+SELECT l.id FROM links l ANTI JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+3
+
+# correlated subqueries: after decorrelation the predicate sits in an inner join below the MARK / SINGLE join
+query I
+SELECT l.id FROM links l WHERE EXISTS (SELECT 1 FROM billing_month bm WHERE l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs)) ORDER BY 1;
+----
+1
+2
+
+query I
+SELECT l.id FROM links l WHERE l.raw_begin IN (SELECT bm.be FROM billing_month bm WHERE l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs)) ORDER BY 1;
+----
+
+query II
+SELECT l.id, (SELECT bm.bs FROM billing_month bm WHERE l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs)) FROM links l ORDER BY 1;
+----
+1	2026-01-01
+2	2026-01-01
+3	NULL
+
+# the remaining predicate can itself be pruned: all raw_end are NULL -> the predicate is always true -> cross product
+statement ok
+CREATE TABLE open_links AS SELECT id, raw_begin, NULL::DATE AS raw_end FROM links;
+
+query II
+EXPLAIN SELECT l.id FROM open_links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs);
+----
+logical_opt	<REGEX>:.*CROSS_PRODUCT.*
+
+query I
+SELECT l.id FROM open_links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1
+2
+3
+
+# ... or disproven: all raw_end precede the month -> the predicate is never true -> empty result
+statement ok
+CREATE TABLE closed_links AS SELECT id, raw_begin, DATE '2025-06-01' AS raw_end FROM links;
+
+query II
+EXPLAIN SELECT l.id FROM closed_links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs);
+----
+logical_opt	<REGEX>:.*EMPTY_RESULT.*
+
+query I
+SELECT l.id FROM closed_links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+
+query I
+SELECT l.id FROM closed_links l LEFT JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) WHERE bm.bs IS NULL ORDER BY 1;
+----
+1
+2
+3
+
+# when the comparison cannot be proven, nothing is pruned and the join stays a comparison join
+statement ok
+INSERT INTO links VALUES (4, DATE '2026-02-01', NULL);
+
+query II
+EXPLAIN SELECT l.id FROM links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs);
+----
+logical_opt	<REGEX>:.*COMPARISON_JOIN.*
+
+query I
+SELECT l.id FROM links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1
+2
+
+# control: the same results without statistics propagation
+statement ok
+DELETE FROM links WHERE id = 4;
+
+statement ok
+SET disabled_optimizers = 'statistics_propagation';
+
+query I
+SELECT l.id FROM links l JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1
+2
+
+query II
+SELECT l.id, bm.bs FROM links l LEFT JOIN billing_month bm ON l.raw_begin <= bm.be AND (l.raw_end IS NULL OR l.raw_end >= bm.bs) ORDER BY 1;
+----
+1	2026-01-01
+2	2026-01-01
+3	NULL
